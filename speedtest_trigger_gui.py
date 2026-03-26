@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import ttk
 
 APP_NAME = "Speedtest Trigger"
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.0.1"
 
 
 def resource_path(filename):
@@ -213,13 +213,17 @@ class SpeedtestGUI:
                 self.root.after(0, self.clear_log)
                 self.log_line(f"Loop started. Interval: {self.get_interval()}s")
 
-                self.run_speedtest_once()
+                result = self.run_speedtest_once()
 
                 if not self.running:
                     break
 
-                interval = self.get_interval()
-                for remaining in range(interval, 0, -1):
+                if result == "retry_soon":
+                    wait_time = 5
+                else:
+                    wait_time = self.get_interval()
+
+                for remaining in range(wait_time, 0, -1):
                     if not self.running:
                         break
                     self.set_status(f"Waiting {remaining}s...")
@@ -230,10 +234,16 @@ class SpeedtestGUI:
             self.update_buttons(False)
 
         except Exception as e:
-            self.running = False
-            self.update_buttons(False)
-            self.set_status("Error")
+            self.set_status("Retrying...")
             self.log_line(f"Loop error: {e}")
+
+            while self.running:
+                for remaining in range(5, 0, -1):
+                    if not self.running:
+                        break
+                    self.set_status(f"Retrying in {remaining}s...")
+                    time.sleep(1)
+                break
 
     def run_speedtest_once(self):
         try:
@@ -250,6 +260,7 @@ class SpeedtestGUI:
             found_isp = False
             found_server = False
             found_ping = False
+            output_lines = []
 
             for raw_line in self.process.stdout:
                 if not self.running:
@@ -259,6 +270,7 @@ class SpeedtestGUI:
                 if not line:
                     continue
 
+                output_lines.append(line)
                 self.log_line(line)
 
                 if line.startswith("ISP:"):
@@ -283,28 +295,65 @@ class SpeedtestGUI:
                 self.process.wait(timeout=5)
 
             if not self.running:
-                return
+                return "stopped"
+
+            joined_output = "\n".join(output_lines)
 
             if self.process and self.process.returncode not in (0, None):
+                retryable_markers = [
+                    "429",
+                    "Too Many Requests",
+                    "Failed to retrieve server list",
+                    "timed out",
+                    "timeout",
+                    "Temporary failure",
+                    "Connection reset",
+                    "Connection aborted",
+                    "Connection refused",
+                    "Name or service not known",
+                    "Network is unreachable",
+                ]
+
+                if any(
+                    marker.lower() in joined_output.lower()
+                    for marker in retryable_markers
+                ):
+                    self.set_status("Rate limited / retrying")
+                    self.log_line(
+                        "Temporary speedtest error detected. Retrying in 5 seconds..."
+                    )
+                    return "retry_soon"
+
                 raise RuntimeError(
                     f"speedtest.py exited with code {self.process.returncode}"
                 )
 
             if found_isp or found_server or found_ping:
                 self.set_status("Updated")
-            else:
-                raise RuntimeError("No ISP/server/ping output detected.")
+                return "ok"
+
+            self.set_status("No data")
+            self.log_line(
+                "No ISP/server/ping output detected. Retrying in 5 seconds..."
+            )
+            return "retry_soon"
 
         except FileNotFoundError:
             self.running = False
             self.update_buttons(False)
             self.set_status("Missing speedtest.py")
             self.log_line("Error: bundled speedtest.py not found.")
+            return "fatal"
+
         except Exception as e:
-            self.running = False
-            self.update_buttons(False)
-            self.set_status("Error")
-            self.log_line(f"Error: {e}")
+            if self.running:
+                self.set_status("Retrying...")
+                self.log_line(f"Error: {e}")
+                self.log_line("Retrying in 5 seconds...")
+                return "retry_soon"
+
+            self.set_status("Stopped")
+            return "stopped"
 
     def on_close(self):
         self.stop_speedtest()
